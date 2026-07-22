@@ -1353,7 +1353,7 @@ def main() -> None:
     print("=" * 50)
     print(f"  Owner ID: {config.OWNER_ID}")
     print(f"  Admins: {len(config.ADMIN_IDS)}")
-    print(f"  MongoDB: {'✅ Connected' if db.db else '❌ Disconnected'}")
+    print(f"  MongoDB: {'✅  Connected' if db.db is not None else '❌  Disconnected'}")
     print(f"  Bot: @{config.BOT_TOKEN.split(':')[0]}")
     print("=" * 50)
     print("  Bot is running. Press Ctrl+C to stop.")
