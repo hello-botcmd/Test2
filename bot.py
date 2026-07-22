@@ -900,7 +900,7 @@ async def handle_confirm_join(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"❌ Failed: `{results['failed']}`\n"
         f"📦 Total: `{results['total']}`\n\n"
         f"**Mode Distribution:**\n{mode_details}\n"
-        f"⏱ _Delay range: {min_delay}s - {max delay}s_"
+        f"⏱ _Delay range: {min_delay}s - {max_delay}s_"
     )
     
     await context.bot.send_message(
