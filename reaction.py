@@ -11,6 +11,7 @@ from datetime import datetime
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.types import ReactionEmoji
 from telethon.errors import FloodWaitError
 
@@ -82,8 +83,10 @@ async def send_reactions(
     for idx, account in enumerate(selected_accounts):
         if cancel_event.is_set():
             if progress_callback:
-                await progress_callback("⛔ Reaction operation cancelled.", 
-                                        int((idx / accounts_to_use) * 100))
+                await progress_callback(
+                    "⛔ Reaction operation cancelled.", 
+                    int((idx / accounts_to_use) * 100)
+                )
             break
         
         phone = account.get("phone", "Unknown")
@@ -107,19 +110,15 @@ async def send_reactions(
             
             # Get the entity
             try:
-                if isinstance(channel_id, int):
-                    entity = await client.get_entity(channel_id)
-                else:
-                    entity = await client.get_entity(channel_id)
+                entity = await client.get_entity(channel_id)
             except Exception:
-                # Try joining first
+                # Try joining first if it fails (mostly for public channels)
                 try:
-                    from telethon.tl.functions.channels import JoinChannelRequest
-                    from telethon.tl.functions.messages import ImportChatInviteRequest
-                    if isinstance(channel_id, int):
+                    if isinstance(channel_id, str):
+                        await client(JoinChannelRequest(channel_id))
                         entity = await client.get_entity(channel_id)
                     else:
-                        entity = await client.get_entity(channel_id)
+                        raise ValueError("Cannot automatically join a private channel by integer ID.")
                 except Exception as e:
                     results["failed"] += 1
                     if progress_callback:
@@ -179,12 +178,12 @@ async def send_reactions(
                 })
                 if progress_callback:
                     await progress_callback(
-                        f"[{idx+1}/{accounts_to_use}] ❌ {display_name} - Error",
+                        f"[{idx+1}/{accounts_to_use}] ❌ {display_name} - Error: {str(e)[:30]}",
                         int(((idx + 1) / accounts_to_use) * 100)
                     )
             
-            # Small delay between reactions
-            await asyncio.sleep(random.uniform(1, 2))
+            # Small delay between reactions to avoid rapid spam blocks
+            await asyncio.sleep(random.uniform(1.5, 3.5))
         
         except Exception as e:
             results["failed"] += 1
