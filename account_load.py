@@ -1,4 +1,4 @@
-"""
+    """
 account_load.py - Account loading and management for the Telegram Account Manager.
 Handles adding accounts via Phone+OTP+2FA, Session String File, and TData.
 """
@@ -18,6 +18,8 @@ from telethon.errors import (
     FloodWaitError,
     PhoneNumberInvalidError,
     PhoneNumberBannedError,
+    AuthKeyUnregisteredError,
+    AuthKeyError
 )
 from telethon.tl.functions.account import UpdateProfileRequest
 import config
@@ -40,6 +42,9 @@ async def connect_and_check(client: TelegramClient) -> bool:
     try:
         await client.connect()
         return await client.is_user_authorized()
+    except (AuthKeyUnregisteredError, AuthKeyError):
+        logger.warning("Session authorization key not found or expired.")
+        return False
     except Exception as e:
         logger.error(f"Connection error: {e}")
         return False
@@ -136,7 +141,6 @@ def get_random_name() -> str:
     except Exception as e:
         logger.warning(f"Error reading name file: {e}")
     
-    # Fallback names
     import random
     fallbacks = [
         "Alex Morgan", "Jordan Riley", "Casey Taylor", "Avery Quinn",
@@ -149,10 +153,6 @@ def get_random_name() -> str:
 def parse_session_file(content: str) -> List[dict]:
     """
     Parse session file content.
-    Supports formats:
-    - Phone: +XXXXXXXXXXXX | Format: TELETHON\\n<session_string>
-    - Raw session strings (one per line)
-    
     Returns list of dicts: [{phone, session_string}, ...]
     """
     accounts = []
@@ -165,14 +165,12 @@ def parse_session_file(content: str) -> List[dict]:
             i += 1
             continue
         
-        # Format: Phone: +XXXXXXXXXXXX | Format: TELETHON
         if line.startswith("Phone:") and "Format: TELETHON" in line:
             phone_match = re.search(r"Phone:\s*(\+?\d[\d\s\-]*)", line)
             phone = phone_match.group(1).strip() if phone_match else None
             if phone:
                 phone = re.sub(r'[\s\-]', '', phone)
             
-            # Next non-empty line should be the session string
             if i + 1 < len(lines):
                 session_str = lines[i + 1].strip()
                 if session_str and not session_str.startswith("Phone:"):
@@ -184,7 +182,6 @@ def parse_session_file(content: str) -> List[dict]:
                     i += 2
                     continue
         else:
-            # Raw session string (long base64-like string)
             if len(line) > 40 and not line.startswith("Phone:"):
                 accounts.append({
                     "phone": None,
@@ -206,14 +203,11 @@ async def validate_session_string(session_str: str) -> Tuple[bool, str, dict]:
         await client.connect()
         if not await client.is_user_authorized():
             await client.disconnect()
-            return False, "❌ Session is not authorized / expired.", {}
+            return False, "❌ Session is expired or unauthorized.", {}
         
         me = await client.get_me()
         phone = getattr(me, "phone", None)
-        # Update name from name.txt
         await update_account_name(client)
-        
-        await client.disconnect()
         
         user_info = {
             "user_id": me.id,
@@ -223,13 +217,49 @@ async def validate_session_string(session_str: str) -> Tuple[bool, str, dict]:
             "last_name": me.last_name or "",
         }
         return True, f"✅ Valid session: @{me.username or 'N/A'} ({phone or 'N/A'})", user_info
-    
+        
+    except (AuthKeyUnregisteredError, AuthKeyError):
+        return False, "❌ Session key unregistered (account logged out or banned).", {}
     except Exception as e:
+        return False, f"❌ Invalid session: {str(e)}", {}
+    finally:
         try:
             await client.disconnect()
         except Exception:
             pass
-        return False, f"❌ Invalid session: {str(e)}", {}
+
+
+async def add_accounts_from_file_content(content: str, added_by: Optional[int] = None) -> dict:
+    """
+    Parses a session file's content and validates/adds accounts safely.
+    """
+    parsed_accounts = parse_session_file(content)
+    results = {"total": len(parsed_accounts), "success": 0, "failed": 0, "details": []}
+
+    for acc in parsed_accounts:
+        session_str = acc["session_string"]
+        is_valid, msg, user_info = await validate_session_string(session_str)
+        
+        if is_valid:
+            saved, save_msg = await save_account_to_db(
+                session_string=session_str,
+                phone=user_info.get("phone") or acc.get("phone"),
+                user_id=user_info.get("user_id"),
+                username=user_info.get("username"),
+                added_by=added_by,
+                source="session_file"
+            )
+            if saved:
+                results["success"] += 1
+                results["details"].append(f"✅ Added: {user_info.get('phone', 'Unknown')}")
+            else:
+                results["failed"] += 1
+                results["details"].append(f"⚠️ Skipped: {save_msg}")
+        else:
+            results["failed"] += 1
+            results["details"].append(f"❌ Failed: {msg}")
+            
+    return results
 
 
 async def save_account_to_db(
@@ -244,24 +274,20 @@ async def save_account_to_db(
     Save an account to MongoDB.
     Checks for duplicates before saving.
     """
-    # Check if session already exists
     existing = db.accounts.find_one({"session_string": session_string})
     if existing:
         return False, "❌ This account (session) is already added."
     
-    # Check by phone if available
     if phone:
         existing_phone = db.accounts.find_one({"phone": phone})
         if existing_phone:
             return False, f"❌ Account with phone {phone} is already in the database."
     
-    # Check by user_id if available
     if user_id:
         existing_id = db.accounts.find_one({"user_id": user_id})
         if existing_id:
             return False, f"❌ Account (ID: {user_id}) is already in the database."
     
-    # Get a random name for the account
     display_name = get_random_name()
     
     account_doc = {
@@ -289,31 +315,27 @@ async def save_account_to_db(
 async def add_account_via_tdata(zip_path: str, added_by: Optional[int] = None) -> Tuple[bool, str, Optional[str]]:
     """
     Add accounts from a tdata folder (zipped).
-    Uses opentele library to convert tdata to Telethon session.
     Returns (success, message, session_string).
     """
     extract_dir = tempfile.mkdtemp()
     try:
-        # Extract zip
         with zipfile.ZipFile(zip_path, 'r') as zf:
             zf.extractall(extract_dir)
         
-        # Find tdata folder
         tdata_path = None
         for root, dirs, files in os.walk(extract_dir):
-            if 'auth_data' in files or 'auth' in files or any(f.startswith('D877F783D5D3EF8C') for f in files):
+            if any(f.startswith('D877F783D5D3EF8C') for f in files) or 'key_datas' in files:
                 tdata_path = root
                 break
-            # Check if any directory name contains 'tdata'
+            
             for d in dirs:
-                if 'tdata' in d.lower():
+                if 'tdata' == d.lower():
                     tdata_path = os.path.join(root, d)
                     break
             if tdata_path:
                 break
         
         if not tdata_path:
-            # Try the extraction root directly
             tdata_path = extract_dir
         
         try:
@@ -323,44 +345,46 @@ async def add_account_via_tdata(zip_path: str, added_by: Optional[int] = None) -
             
             tdesk = TDesktop(tdata_path)
             if not tdesk.isLoaded():
-                return False, "❌ Failed to load tdata folder. It may be corrupted or empty.", None
+                return False, "❌ Failed to load tdata folder. It may be corrupted or missing key files.", None
             
-            # Convert to Telethon client
             client = await tdesk.ToTelethon(
                 session=StringSession(),
                 flag=UseCurrentSession
             )
             
-            await client.connect()
-            if not await client.is_user_authorized():
-                await client.disconnect()
-                return False, "❌ TData session is not authorized.", None
-            
-            me = await client.get_me()
-            phone = getattr(me, "phone", None)
-            
-            # Get the session string
-            session_str = client.session.save()
-            
-            # Update profile name
-            await update_account_name(client)
-            
-            await client.disconnect()
-            
-            # Save to DB
-            success, msg = await save_account_to_db(
-                session_string=session_str,
-                phone=phone,
-                user_id=me.id,
-                username=me.username,
-                added_by=added_by,
-                source="tdata"
-            )
-            
-            if success:
-                return True, f"✅ TData account added: @{me.username or 'N/A'} ({phone or 'N/A'})", session_str
-            else:
-                return False, msg, session_str
+            try:
+                await client.connect()
+                if not await client.is_user_authorized():
+                    await client.disconnect()
+                    return False, "❌ TData session is not authorized.", None
+                
+                me = await client.get_me()
+                phone = getattr(me, "phone", None)
+                
+                session_str = client.session.save()
+                await update_account_name(client)
+                
+                success, msg = await save_account_to_db(
+                    session_string=session_str,
+                    phone=phone,
+                    user_id=me.id,
+                    username=me.username,
+                    added_by=added_by,
+                    source="tdata"
+                )
+                
+                if success:
+                    return True, f"✅ TData account added: @{me.username or 'N/A'} ({phone or 'N/A'})", session_str
+                else:
+                    return False, msg, session_str
+                    
+            except (AuthKeyUnregisteredError, AuthKeyError):
+                return False, "❌ TData session key unregistered (account logged out or banned).", None
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
                 
         except ImportError:
             return False, "❌ 'opentele' library not installed. Install with: pip install opentele", None
@@ -372,7 +396,6 @@ async def add_account_via_tdata(zip_path: str, added_by: Optional[int] = None) -
     except Exception as e:
         return False, f"❌ Error processing tdata: {str(e)}", None
     finally:
-        # Cleanup temp directory
         try:
             import shutil
             shutil.rmtree(extract_dir, ignore_errors=True)
